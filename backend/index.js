@@ -1,98 +1,264 @@
 const express = require('express');
 const mongoose = require('mongoose');
 const cors = require('cors');
-// body-parser đã được tích hợp vào express.json() từ Express 4.16+
-const Student = require('./Student'); // Import Model Student (từ file Student.js)
+const Student = require('./Student');
 
 const app = express();
-const PORT = 5000; // Server chạy trên cổng 5000 [cite: 28]
+const PORT = process.env.PORT || 5000;
+const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://localhost:27017/student_db';
 
 // --- MIDDLEWARE ---
-// Cho phép frontend truy cập API (CORS) [cite: 29]
 app.use(cors()); 
+app.use(express.json({ limit: '10mb' })); // Limit request size
 
-// Parse JSON request body [cite: 29]
-app.use(express.json());
+// Request logging middleware
+app.use((req, res, next) => {
+  console.log(`${new Date().toISOString()} - ${req.method} ${req.path}`);
+  next();
+});
 
 // --- KẾT NỐI MONGODB ---
-mongoose.connect('mongodb://localhost:27017/student_db') // Kết nối đến container MongoDB [cite: 47, 48]
+mongoose.connect(MONGODB_URI)
   .then(() => console.log("✅ Đã kết nối MongoDB thành công"))
-  .catch(err => console.error("❌ Lỗi kết nối MongoDB:", err));
+  .catch(err => {
+    console.error("❌ Lỗi kết nối MongoDB:", err);
+    process.exit(1); // Exit if MongoDB connection fails
+  });
 
+// MongoDB connection event handlers
+mongoose.connection.on('disconnected', () => {
+  console.warn("⚠️ MongoDB đã ngắt kết nối");
+});
+
+mongoose.connection.on('reconnected', () => {
+  console.log("✅ MongoDB đã kết nối lại");
+});
+
+
+// --- HELPER FUNCTION ---
+// Validate MongoDB ObjectId
+const isValidObjectId = (id) => {
+  return mongoose.Types.ObjectId.isValid(id);
+};
+
+// Standard error response
+const sendError = (res, statusCode, message) => {
+  return res.status(statusCode).json({ 
+    success: false,
+    error: message 
+  });
+};
+
+// Standard success response
+const sendSuccess = (res, data, statusCode = 200) => {
+  return res.status(statusCode).json({
+    success: true,
+    data: data
+  });
+};
+
+// --- HEALTH CHECK ---
+app.get('/api/health', (req, res) => {
+  const healthStatus = {
+    status: 'OK',
+    timestamp: new Date().toISOString(),
+    uptime: process.uptime(),
+    database: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected'
+  };
+  res.json(healthStatus);
+});
 
 // --- ROUTES API (CRUD) ---
-// Đảm bảo tiền tố route API là /api [cite: 69]
 
-// 1. READ (All): Lấy danh sách tất cả học sinh (GET /api/students) [cite: 60]
+// 1. READ (All): Lấy danh sách tất cả học sinh
 app.get('/api/students', async (req, res) => {
   try {
-    const students = await Student.find(); // Tìm tất cả documents
-    res.json(students);
+    const students = await Student.find().sort({ createdAt: -1 }); // Sort by newest first
+    return sendSuccess(res, students);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error('Error fetching students:', err);
+    return sendError(res, 500, 'Không thể lấy danh sách học sinh');
   }
 });
 
-// 1b. READ (Single): Lấy thông tin chi tiết một học sinh theo ID (Sử dụng cho Edit) [cite: 178]
+// 1b. READ (Single): Lấy thông tin chi tiết một học sinh theo ID
 app.get('/api/students/:id', async (req, res) => {
   try {
-    const student = await Student.findById(req.params.id);
-    if (!student) {
-      return res.status(404).json({ error: "Student not found" });
+    const { id } = req.params;
+    
+    if (!isValidObjectId(id)) {
+      return sendError(res, 400, 'ID không hợp lệ');
     }
-    res.json(student);
+
+    const student = await Student.findById(id);
+    if (!student) {
+      return sendError(res, 404, 'Không tìm thấy học sinh');
+    }
+    
+    return sendSuccess(res, student);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error('Error fetching student:', err);
+    return sendError(res, 500, 'Không thể lấy thông tin học sinh');
   }
 });
 
 
-// 2. CREATE: Thêm học sinh mới (POST /api/students) [cite: 96]
+// 2. CREATE: Thêm học sinh mới
 app.post('/api/students', async (req, res) => {
   try {
-    // req.body chứa thông tin { name, age, class }
-    const newStudent = await Student.create(req.body); // tạo document mới từ dữ liệu gửi lên [cite: 98]
-    res.status(201).json(newStudent); // Trả về 201 Created và dữ liệu [cite: 100]
-  } catch (e) {
-    res.status(400).json({ error: e.message }); // Lỗi Validation
+    const { name, age, class: stuClass } = req.body;
+
+    // Basic validation
+    if (!name || !age || !stuClass) {
+      return sendError(res, 400, 'Vui lòng điền đầy đủ thông tin (tên, tuổi, lớp)');
+    }
+
+    // Trim and validate input
+    const trimmedName = name.trim();
+    const trimmedClass = stuClass.trim();
+    const ageNum = Number(age);
+
+    if (!trimmedName) {
+      return sendError(res, 400, 'Tên học sinh không được để trống');
+    }
+
+    if (isNaN(ageNum) || !Number.isInteger(ageNum)) {
+      return sendError(res, 400, 'Tuổi phải là số nguyên');
+    }
+
+    if (ageNum < 1 || ageNum > 120) {
+      return sendError(res, 400, 'Tuổi phải từ 1 đến 120');
+    }
+
+    const newStudent = await Student.create({
+      name: trimmedName,
+      age: ageNum,
+      class: trimmedClass
+    });
+
+    return sendSuccess(res, newStudent, 201);
+  } catch (err) {
+    console.error('Error creating student:', err);
+    
+    // Handle Mongoose validation errors
+    if (err.name === 'ValidationError') {
+      const messages = Object.values(err.errors).map(e => e.message).join(', ');
+      return sendError(res, 400, messages);
+    }
+    
+    return sendError(res, 500, 'Không thể thêm học sinh');
   }
 });
 
-// 3. UPDATE: Cập nhật thông tin học sinh theo ID (PUT /api/students/:id) [cite: 157]
+// 3. UPDATE: Cập nhật thông tin học sinh theo ID
 app.put('/api/students/:id', async (req, res) => {
   try {
+    const { id } = req.params;
+    const { name, age, class: stuClass } = req.body;
+
+    if (!isValidObjectId(id)) {
+      return sendError(res, 400, 'ID không hợp lệ');
+    }
+
+    // Build update object with only provided fields
+    const updateData = {};
+    if (name !== undefined) {
+      const trimmedName = name.trim();
+      if (!trimmedName) {
+        return sendError(res, 400, 'Tên học sinh không được để trống');
+      }
+      updateData.name = trimmedName;
+    }
+    
+    if (age !== undefined) {
+      const ageNum = Number(age);
+      if (isNaN(ageNum) || !Number.isInteger(ageNum)) {
+        return sendError(res, 400, 'Tuổi phải là số nguyên');
+      }
+      if (ageNum < 1 || ageNum > 120) {
+        return sendError(res, 400, 'Tuổi phải từ 1 đến 120');
+      }
+      updateData.age = ageNum;
+    }
+    
+    if (stuClass !== undefined) {
+      updateData.class = stuClass.trim();
+    }
+
     const updatedStu = await Student.findByIdAndUpdate(
-      req.params.id, // ID từ URL [cite: 161]
-      req.body, // Dữ liệu cần cập nhật [cite: 162]
-      { new: true } // Trả về document sau khi update [cite: 163, 173]
+      id,
+      updateData,
+      { new: true, runValidators: true }
     );
 
     if (!updatedStu) {
-      return res.status(404).json({ error: "Student not found" }); // ID không tồn tại [cite: 166, 174]
+      return sendError(res, 404, 'Không tìm thấy học sinh');
     }
-    res.json(updatedStu); // Trả về học sinh đã được cập nhật [cite: 167]
+
+    return sendSuccess(res, updatedStu);
   } catch (err) {
-    res.status(400).json({ error: err.message }); // Lỗi Validation [cite: 170]
+    console.error('Error updating student:', err);
+    
+    if (err.name === 'ValidationError') {
+      const messages = Object.values(err.errors).map(e => e.message).join(', ');
+      return sendError(res, 400, messages);
+    }
+    
+    return sendError(res, 500, 'Không thể cập nhật thông tin học sinh');
   }
 });
 
-// 4. DELETE: Xóa học sinh theo ID (DELETE /api/students/:id) [cite: 240]
+// 4. DELETE: Xóa học sinh theo ID
 app.delete('/api/students/:id', async (req, res) => {
   try {
-    const id = req.params.id;
-    const deleted = await Student.findByIdAndDelete(id); // Xóa document khỏi DB [cite: 244]
+    const { id } = req.params;
+
+    if (!isValidObjectId(id)) {
+      return sendError(res, 400, 'ID không hợp lệ');
+    }
+
+    const deleted = await Student.findByIdAndDelete(id);
 
     if (!deleted) {
-      return res.status(404).json({ error: "Student not found" }); // ID không tồn tại [cite: 245]
+      return sendError(res, 404, 'Không tìm thấy học sinh');
     }
-    res.json({ message: "Đã xóa học sinh", id: deleted._id }); // Trả về thông báo thành công [cite: 247]
+
+    return sendSuccess(res, { 
+      message: 'Đã xóa học sinh thành công',
+      id: deleted._id 
+    });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error('Error deleting student:', err);
+    return sendError(res, 500, 'Không thể xóa học sinh');
   }
+});
+
+// 404 handler for undefined routes
+app.use((req, res) => {
+  sendError(res, 404, 'API endpoint không tồn tại');
+});
+
+// Global error handler
+app.use((err, req, res, next) => {
+  console.error('Unhandled error:', err);
+  sendError(res, 500, 'Lỗi máy chủ nội bộ');
 });
 
 
 // --- KHỞI ĐỘNG SERVER EXPRESS ---
-app.listen(PORT, () => {
+const server = app.listen(PORT, () => {
   console.log(`🌍 Express server running on port ${PORT}`);
+  console.log(`📍 Health check: http://localhost:${PORT}/api/health`);
+});
+
+// Graceful shutdown
+process.on('SIGTERM', () => {
+  console.log('SIGTERM signal received: closing HTTP server');
+  server.close(() => {
+    console.log('HTTP server closed');
+    mongoose.connection.close(false, () => {
+      console.log('MongoDB connection closed');
+      process.exit(0);
+    });
+  });
 });
